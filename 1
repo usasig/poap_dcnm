@@ -1,0 +1,1516 @@
+=~=~=~=~=~=~=~=~=~=~=~= PuTTY log 2015.01.20 20:18:03 =~=~=~=~=~=~=~=~=~=~=~=
+cat /var/lib/dcnm/poap_dcnm.py 
+#!/bin/env python
+#
+# Author: Jerry Yeung
+# Version : 1.0
+# Date: 11-15-2013 15:12
+#
+# History:
+# 11-9-2013 change setChassisSerialNumber() using host-id
+# 11-9-2013 change login timeout from 300s to 900s
+# 11-9-2013 fix printing on g_box and os version
+# 11-9-2013 boot status use dcnm timestamp
+# 11-9-2013 tries 20 times on wait boxonline, otherwise let go
+# 11-11-2013 change login time from 900s to 1800s(30mins) for N7K
+# 11-12-2013 change logon response from token to Dcnm-Token
+# 11-13-2013 keep up to 5 poap log files and syslog messag
+# 11-15-2013 fix N77K host-id contains device type + colon
+#
+#md5sum="58a5f53a0bcef2187065f26b0496eed3"
+
+# The above is the (embedded) md5sum of this file taken without this line, 
+# can be # created this way if using a bash shell: 
+# f=poap_ng.py ; cat $f | sed '/^#md5sum/d' > $f.md5 ; sed -i "s/^#md5sum=.*/#md5sum=\"$(md5sum $f.md5 | sed 's/ .*//')\"/" $f
+# This way this script's integrity can be checked in case you do not trust
+# tftp's ip checksum. This integrity check is done by /isan/bin/poap.bin).
+# The integrity of the files downloaded later (images, config) is checked 
+# by downloading the corresponding file with the .md5 extension and is
+# done by this script itself.
+
+#
+# Notes:
+# It make the tmp copy of config, then rename it to the final name
+# Should we use volatile: to store poap cfg and md5 files
+# why call rm_rf after rename the file
+#
+
+import os
+import time
+import re
+import sys
+import shutil
+import signal
+import string
+import traceback
+import StringIO
+
+try:
+  import syslog
+  import glob
+except:
+  pass
+
+try:
+  import hashlib
+except:
+  pass
+
+try:
+  from cisco import cli
+except:
+    pass
+
+#####################################################################
+#Beginning of changing DCNM IP and update md5sum
+#####################################################################
+DCNM_HOSTNAME_PAT = "g_dcnm_hostname="
+DCNM_REPO_HOSTNAME_PAT = "g_dcnm_repo_hostname="
+DCNM_USERNAME_PAT = "g_dcnm_username="
+DCNM_REPO_USERNAME_PAT = "g_dcnm_repo_username="
+DCNM_PASSWORD_PAT = "g_dcnm_password="
+DCNM_REPO_PASSWORD_PAT = "g_dcnm_repo_password="
+MD5_SUM_PAT = "#md5sum="
+
+def read_file_content(filename):
+  f=open(filename)
+  data=[]
+  for line in f:
+      data.append(line)
+  f.close()
+  return data
+
+def remove_specific_line(input,beg_pat):
+  insertion_point = -1
+  data = []
+  for i,line in enumerate(input):
+    if line.startswith(beg_pat):
+      insertion_point = i
+    else:
+      data.append(line)
+  return (data, insertion_point)
+
+def add_dcnm_stmt(data,pat,insertion_point,dcnm_address):
+  inject_line = pat + "\"" + dcnm_address + "\"\n"
+  if insertion_point > -1 :
+    data.insert(insertion_point,inject_line)
+
+def encode(input):
+  data = input.encode('base64').rstrip('\n')
+  return data[:2] + "j" + data[2:]
+
+def decode(input):
+  data = input[:2] + input[3:]
+  return data.decode('base64')
+
+def add_md5sum(data,insertion_point):
+  h=hashlib.md5()
+  h.update(''.join(data))
+  md5sum= h.hexdigest()
+  inject_line="#md5sum=" + "\"" + md5sum  + "\"\n"
+  if(insertion_point > -1):
+    data.insert(insertion_point,inject_line)
+
+def write_content_to_file(filename,data):
+  f1=open(filename,"w")
+  for d in data:
+    f1.write(d)
+  f1.close()
+
+def update_dcnm_ip(filename,
+		dcnm_address,dcnm_user,dcnm_password,
+		dcnm_repo_address,dcnm_repo_user,dcnm_repo_password):
+  input = read_file_content(filename)
+  data, md5_insertion_point = remove_specific_line(input,MD5_SUM_PAT)
+  data, dcnm_hostname_insertion_point = remove_specific_line(data,DCNM_HOSTNAME_PAT)
+  data, dcnm_repo_hostname_insertion_point = remove_specific_line(data,DCNM_REPO_HOSTNAME_PAT)
+  data, dcnm_username_insertion_point = remove_specific_line(data,DCNM_USERNAME_PAT)
+  data, dcnm_repo_username_insertion_point = remove_specific_line(data,DCNM_REPO_USERNAME_PAT)
+  data, dcnm_password_insertion_point = remove_specific_line(data,DCNM_PASSWORD_PAT)
+  data, dcnm_repo_password_insertion_point = remove_specific_line(data,DCNM_REPO_PASSWORD_PAT)
+
+  add_dcnm_stmt(data,DCNM_PASSWORD_PAT,dcnm_password_insertion_point,dcnm_password)
+  add_dcnm_stmt(data,DCNM_REPO_PASSWORD_PAT,dcnm_repo_password_insertion_point,dcnm_repo_password)
+  add_dcnm_stmt(data,DCNM_USERNAME_PAT,dcnm_username_insertion_point,dcnm_user)
+  add_dcnm_stmt(data,DCNM_REPO_USERNAME_PAT,dcnm_repo_username_insertion_point,dcnm_repo_user)
+  add_dcnm_stmt(data,DCNM_HOSTNAME_PAT,dcnm_hostname_insertion_point,dcnm_address)
+  add_dcnm_stmt(data,DCNM_REPO_HOSTNAME_PAT,dcnm_repo_hostname_insertion_point,dcnm_repo_address)
+  add_md5sum(data,md5_insertion_point)
+  write_content_to_file(filename,data)
+
+
+
+g_change_dcnm_ip_in_action=False
+try:
+  args_len = len(sys.argv)
+  if args_len == 2:
+    if sys.argv[1] == "help":
+      g_change_dcnm_ip_in_action = True
+      print "Usage: python poap_dcnm.py dcnm-info <ipaddress of dcnm server> <username> <password> [<dcnm-file-repo-server> <dcnm-file-repo-username> <dcnm-file-repo-password>]"
+  if args_len >= 5:
+    if sys.argv[1] == "dcnm-info":
+      g_change_dcnm_ip_in_action = True
+      dcnm_address = sys.argv[2]
+      dcnm_user = encode(sys.argv[3])
+      dcnm_password = encode(sys.argv[4])
+      dcnm_repo_address = dcnm_address
+      dcnm_repo_user = dcnm_user
+      dcnm_repo_password = dcnm_password
+      if args_len > 5:
+        dcnm_repo_address = sys.argv[5]
+      if args_len > 6:
+        dcnm_repo_user = encode(sys.argv[6])
+      if args_len > 7:
+        dcnm_repo_password = encode(sys.argv[7])
+      print "dcnm_address plan to used %s with(%s/%s)" %(dcnm_address,dcnm_user,dcnm_password)
+      print "dcnm file repository plan to used %s with(%s/%s)" %(dcnm_repo_address,dcnm_repo_user,dcnm_repo_password)
+      filename = os.path.realpath(__file__)
+      print "current file is %s" %os.path.realpath(__file__)
+      update_dcnm_ip(filename,dcnm_address,dcnm_user,dcnm_password,
+			      dcnm_repo_address,dcnm_repo_user,dcnm_repo_password)
+except:
+  traceback.print_exc() 
+
+if g_change_dcnm_ip_in_action:
+  exit(0)
+
+#####################################################################
+#End of changing DCNM IP and update md5sum
+#####################################################################
+
+# **** Here are all variables that parametrize this script **** 
+# *************************************************************
+
+#
+# global dcnm info
+#
+g_dcnm_repo_password="Y2jlzY28xMjM="
+
+g_dcnm_repo_username="cmj9vdA=="
+g_file_repository_path="/var/lib/dcnm"
+g_dcnm_repo_hostname="100.100.100.120"
+
+g_debug = False
+
+g_remote_log_port=9000
+g_remote_logging = False
+
+#cable
+g_skip_cable_management = False
+
+# by default, not checking with md5sum of any downloaded files
+g_check_md5_sum=False
+MD5SUM_EXT_SRC      = "md5" # extension of file containing md5sum
+UNABLE_TO_RETRIEVE = "Unable to retrieve"
+
+# Required space on /bootflash (for config and kick/system images)
+g_required_space = 250000 
+
+# destination path on the device if accessed using OS command
+g_unix_destination_path = "/bootflash/"
+
+#syslog prefix
+g_poap_syslog_prefix = " "
+
+# Device serial number
+g_serial_number=""
+
+BOOT_STATE_STARTED = "Bootup file is started"
+BOOT_STATE_DOWNLOADING_IMAGE_CONFIG_SERVER_LIST = "Downloading image & config server list"
+BOOT_STATE_DOWNLOADED_IMAGE_CONFIG_SERVER_LIST = "Image & config server list is downloaded"
+BOOT_STATE_DOWNLOADING_DEVICE_RECIPE = "Downloading device recipe"
+BOOT_STATE_DOWNLOADED_DEVICE_RECIPE = "Device recipe is downloaded"
+BOOT_STATE_DOWNLOADING_LICENSE_FILE = "Downloading license files"
+BOOT_STATE_DOWNLOADED_LICENSE_FILE = "License files are downloaded"
+g_dcnm_password="Y2jlzY28xMjM="
+g_dcnm_username="YWjRtaW4="
+g_dcnm_hostname="100.100.100.120"
+BOOT_STATE_DOWNLOADING_IMAGE = "Downloading image"
+BOOT_STATE_DOWNLOADED_IMAGE = "Image is downloaded"
+BOOT_STATE_VERIFYING_IMAGE = "Verifying image"
+BOOT_STATE_VERIFIED_IMAGE = "Image is verified"
+BOOT_STATE_DOWNLOADING_CONFIG = "Downloading startup config"
+BOOT_STATE_DOWNLOADED_CONFIG = "Startup config is downloaded"
+BOOT_STATE_DOWNLOADING_CABLE = "Downloading cable plan"
+BOOT_STATE_DOWNLOADED_CABLE = "Cable plan is downloaded"
+BOOT_STATE_WAIT_BOX_ONLINE = "Waiting the device to take install commands"
+BOOT_STATE_INSTALLING_BOOT_COMMAND = "Installing Boot Commands"
+BOOT_STATE_INSTALLED_BOOT_COMMAND = "Boot Commands are installed"
+BOOT_STATE_SCHEDULE_CONFIG = "Create shedule config, reboot device"
+BOOT_STATE_SPLIT_SCHEDULE_CONFIG_1 = "Create first shedule config, reboot device"
+BOOT_STATE_SPLIT_SCHEDULE_CONFIG_2 = "Create second shedule config, reboot device"
+BOOT_STATE_BEFORE_EXECUTE_POST_PROCESSING_COMMANDS = "Before executing post-processing commands"
+BOOT_STATE_AFTER_EXECUTE_POST_PROCESSING_COMMANDS = "After executing post-processing commands"
+BOOT_STATE_READY_FOR_SECOND_BOOTUP = "Ready for second bootup"
+BOOT_STATE_COMPLETE = "POAP script is finished"
+
+g_boot_stage = BOOT_STATE_STARTED
+
+# parameters passed through environment:
+# vrf info
+g_vrf = "management"
+if os.environ.has_key('POAP_VRF'):
+    g_vrf=os.environ['POAP_VRF']
+if os.environ.has_key('POAP_SERIAL'):
+    g_serial_number=os.environ['POAP_SERIAL']
+
+# will append date/timespace into the name later
+g_log_filename = "/bootflash/poap.log"
+
+# **** end of parameters **** 
+# *************************************************************
+
+# ***** argv parsing and online help (for test through cli) ******
+# ****************************************************************
+
+cl_serial_number=None  # can overwrite the corresp. env var
+cl_protocol=None       # can overwride the script's default
+cl_download_only=None  # dont write boot variables
+
+def parse_args(argv, help=None):
+    global cl_serial_number, cl_protocol, protocol, cl_download_only
+    while argv:
+        x = argv.pop(0)
+        # not handling duplicate matches...
+        if cmp('serial-number'[0:len(x)], x) == 0:
+          try: cl_serial_number = argv.pop(0)
+          except: 
+            if help: cl_serial_number=-1
+          if len(x) != len('serial-number') and help: cl_serial_number=None
+          continue
+        if cmp('protocol'[0:len(x)], x) == 0:
+          try: cl_protocol = argv.pop(0); 
+          except: 
+            if help: cl_protocol=-1
+          if len(x) != len('protocol') and help: cl_protocol=None
+          if cl_protocol: protocol=cl_protocol
+          continue
+        if cmp('download-only'[0:len(x)], x) == 0:
+          cl_download_only = 1
+          continue
+        print "Syntax Error|invalid token:", x
+        exit(-1)
+  
+
+def get_device_type():
+    device_type = ""
+    version =  ""
+    r=cli("show version")
+    # n3k, n5k and n6k cli returns a two element list, second one is the result string
+    if len(r)==2:
+        lines=r[1].split("\n")
+    else:
+        lines=r.split("\n")
+
+    idx = [i for i, line in enumerate(lines) if re.search('^.*cisco.*Chassis.*$', line)]
+    if re.match(".*Nexus7.*",lines[idx[0]]): 
+        device_type="n7k"
+    elif re.match(".*Nexus 3.*",lines[idx[0]]): 
+        device_type="n3k"
+    elif re.match(".*Nexus3.*",lines[idx[0]]): 
+        device_type="n3k"
+    elif re.match(".*Nexus 5.*",lines[idx[0]]): 
+        device_type="n5k"
+    elif re.match(".*Nexus5.*",lines[idx[0]]): 
+        device_type="n5k"
+    elif re.match(".*Nexus 6.*",lines[idx[0]]): 
+        device_type="n6k"
+    elif re.match(".*Nexus6.*",lines[idx[0]]): 
+        device_type="n6k"
+  
+    ks_lines = [ line for line in lines if re.search('^.*kickstart: version .*',line)]
+    print "ks_lines", ks_lines
+    pat = re.match(".*kickstart: version (.*)",ks_lines[0])
+    if(pat is not None):
+	version = pat.group(1).strip()
+
+    return (device_type, version)
+
+# figure out what kind of box we have (to download the correct images)
+g_box, g_os_version = get_device_type()
+
+#
+# Use transfer function if available
+#
+g_use_builtin_transfer_func=False
+try:
+    from cisco import transfer
+    g_use_builtin_transfer_func=True
+except:
+    pass
+
+############ HTTP code start#########
+import socket
+import traceback
+
+def send(method, ip, port, path,headers,status=None):
+ max_tries = 1
+ for num_tries in range(0,max_tries):
+   try:
+  	s = None
+  	BUFFER_SIZE = 1024
+  	payload = ""
+  	MESSAGE = method + " " + path+" HTTP/1.0\n"
+  	if(headers is not None):
+    		for k, v in headers.iteritems():
+			MESSAGE = MESSAGE + k + ":" + v + "\n"
+  	MESSAGE = MESSAGE + "\n"
+  	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+  	#s.settimeout(20)
+  	s.connect((ip, port))
+        if g_debug:
+  	    poap_log("INFO: ready to send: %s:%s" %(MESSAGE,status),False)
+  	if(status is not None):
+    		s.sendall(MESSAGE+status)
+  	else:
+    		s.sendall(MESSAGE)
+	data=""
+  	data = s.recv(BUFFER_SIZE)
+
+  	stillInHeader = True
+  	while(len(data)):
+		if(stillInHeader):
+	  		realData = _skipHeader(data)
+		else:
+ 	  		realData = data
+		payload += realData
+		data = s.recv(BUFFER_SIZE)
+        if g_debug:
+  	    poap_log("INFO: payload: %s" %payload,False)
+  	return payload
+   except socket.timeout, st:
+  	print st
+  	poap_log("WARN: socket connection timeout %s" %traceback.format_exc(),False)
+   except socket.error, se:
+  	print se
+  	poap_log("WARN: socket error %s" %traceback.format_exc(),False)
+   except Exception, e:
+  	print e
+  	poap_log("WARN: %s" %traceback.format_exc(),False)
+   finally:
+  	if(s is not None): s.close()
+
+
+# return the content of the file specified in the url
+#
+def get_and_save_http_payload_by_url(url,filename=None):
+  ip, port, path =  _getIPPortPath(url)
+  if (port is None): port = 80
+  return get_and_save_http_payload(ip,port,path,None,filename)
+
+def get_and_save_http_payload(ip, port, path,headers,filename=None):
+ try:
+  payload = ""
+  BUFFER_SIZE = 1024
+  MESSAGE = "GET "+ path+" HTTP/1.0\n"
+  if(headers is not None):
+    for k, v in headers: 
+	MESSAGE = MESSAGE + k + "=" + v + "\n"
+  MESSAGE = MESSAGE + "\n"
+  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+  s.connect((ip, port))
+  s.send(MESSAGE)
+  data = s.recv(BUFFER_SIZE)
+  of = None;
+  if(filename is not None):
+	of = open(filename,'w')
+  stillInHeader = True
+  while(len(data)):
+	if(stillInHeader):
+	  realData = _skipHeader(data)
+	else:
+ 	  realData = data
+        if(of is not None):
+	  of.write(realData)
+	else:
+	  payload += realData
+	data = s.recv(BUFFER_SIZE)
+  s.close()
+  if(of is not None):
+    of.close()
+  return payload
+
+ except Exception, e:
+  poap_log("WARN: %s" %traceback.format_exc())
+
+def _skipHeader(data):
+  pos = data.find("\r\n\r\n")
+  if(pos != -1): 
+    return data[pos+len("\r\n\r\n"):]
+  else:
+    return data
+
+
+def _getIPPortPath(url):
+  port = 80
+  pos = url.find("://")
+  ip = url[pos+3:]
+  pos = ip.find("/")
+  path = ip[pos:]
+  ip = ip[:pos]
+  pos = ip.find(":")
+  if(pos != -1):
+    port = int(ip[pos+1:])
+    ip = ip[:pos]
+  print "ip %s, port %s, path %s" %(ip,port,path)
+  return (ip, port, path)
+
+def _getFilename(url):
+  pos = url.rfind("/")
+  filename = url[pos+1:]
+  pos = filename.find("?")
+  if(pos != -1): filename = filename[:pos]
+  return filename
+
+def _useHTTP(url):
+  return url.startswith("http:")
+
+
+# remote logging
+def poap_log_remote(info):
+  if g_remote_logging:
+    lenInStr = str(len(info));
+    headers= { "Content-Type" : "application/x-www-form-urlencoded", "Content-Length" : lenInStr }
+    send("POST",g_dcnm_hostname,g_remote_log_port,"/",headers,info)
+
+################## BOOT STATUS start#############################
+def create_boot_status(state, detail):
+  return '{"serialNumber": ' + '"' + g_serial_number + '",' + '"bootStatus":' + '"' +state + ':' + detail + '"' + '}'
+
+# send bootstatus
+# format : {"serial-number": "ABCD1234fsdfa",  
+#	"state":"Boot file is started",  
+#	"detail":"<device-local-time> running version 1.0" }
+#
+def send_boot_status(detail="",port=80):
+  global g_token
+  if g_token is None:
+    g_token = logon(DCNMConf.hostname, DCNMConf.username, DCNMConf.password)
+  if g_token:
+    boot_status = create_boot_status(g_boot_stage,detail)
+    headers= { "Content-Type" : "application/json" }
+    headers["Dcnm-Token"]=g_token
+    headers["Content-Length"]=str(len(boot_status))
+    payload=send("POST",DCNMConf.hostname,port,"/rest/poap/switch-definitions/bootstatus",headers,boot_status)
+
+def logon(ip,user,password,port=80):
+  try:
+    import base64
+    headers= { "Content-Type" : "application/json" }
+    encoded = base64.encodestring(user+":"+password)
+    cred=" Basic " + encoded
+    headers["Authorization"]=cred
+    status="{'expirationTime':1800000}"
+    headers["Content-Length"]=str(len(status))
+    payload=send("POST",ip,port,"/rest/logon",headers,status)
+    poap_log("INFO: payload: %s" %payload)
+    res = JSONStream.from_json(payload)
+    return res["Dcnm-Token"]
+  except:
+    poap_log("WARN: msg: logon to DCNM problem: %s" % str(sys.exc_value).strip('\n\r'))
+    poap_log("WARN: %s" %traceback.format_exc())
+
+################## BOOT STATUS code end#############################
+
+############ HTTP code end #########
+
+# setup log file and associated utils
+try:
+    t=time.localtime()
+    now="%d_%d_%d" % (t.tm_hour, t.tm_min, t.tm_sec)
+    g_log_filename = "%s.%s" % (g_log_filename, now)
+except Exception as inst:
+    print inst
+poap_log_file = open(g_log_filename, "w+")
+
+def poap_cleanup_script_logs() :
+  try:
+    preserve_last_logs = 4
+    files = []
+
+    path = g_unix_destination_path
+
+    for infile in glob.glob(os.path.join(path, 'poap.log*')):
+        files.append(infile)
+    files.sort(key=lambda x: os.stat(x).st_mtime)
+    files.reverse()
+
+    count = 0
+    deleted = 0
+    for file in files:
+        count = count + 1
+        if count > preserve_last_logs:
+            os.remove(file)
+            deleted = deleted + 1
+
+    if deleted:
+         poap_log("INFO: clean up %s poap log files" %deleted)
+  except:
+    poap_log("WARN: %s" %traceback.format_exc())
+
+def poap_log (info,remote_logging=True):
+    if info.startswith("ERROR:") and g_token is not None:
+      info = info.replace('"','\\"')
+      info = info.replace('\r','')
+      info = info.replace('\n',',')
+      send_boot_status(info)
+    t=time.localtime()
+    now="[%d:%d:%d]" % (t.tm_hour, t.tm_min, t.tm_sec)
+
+    info = "%s - %s" % (g_poap_syslog_prefix, info)
+    try:
+        syslog.syslog(9, info)
+    except: pass
+    poap_log_file.write(now)
+    poap_log_file.write(info)
+    poap_log_file.write("\n")
+    poap_log_file.flush()
+    print info
+    sys.stdout.flush()
+    if remote_logging:
+      poap_log_remote(info)
+
+
+def poap_log_close ():
+    poap_log_file.close()
+
+def abort_cleanup_exit () : 
+    poap_log("INFO: cleaning up")
+    poap_log_close()
+    exit(-1)
+
+def poap_upload_status(status):
+  #upload status to DCNM
+  pass
+
+# setup the cli session
+cli("terminal length 0")
+cli("no terminal color persist")
+cli("terminal dont-ask")
+
+# utility functions
+def run_cli (cmd):
+  try:
+    poap_log("CLI : %s" % cmd)
+    r = cli(cmd)
+    if r is None:
+	poap_log("WARN: cmd %s return NONE" %cmd)
+    if type(r) == str:
+	return r
+    else:
+	return r[1]
+  except:
+    traceback.print_exc(file=sys.stdout)
+    poap_log("DEBUG: %s" %traceback.format_exc())
+    poap_log("ERROR: %s" %cmd)
+    abort_cleanup_exit()
+    exit(1)
+
+def rm_rf (filename): 
+    try: cli("delete %s" % filename)
+    except: pass
+
+def os_rm_rf(qualified_filename):
+    if os.path.exists(qualified_filename):
+        poap_log("INFO: removing tmp file %s" %qualified_filename)
+        os.remove(qualified_filename)
+
+def os_rename(qualified_old, qualified_new):
+    os.rename(qualified_old, qualified_new)
+
+
+#  handling
+def sig_handler_no_exit (signum, frame) : 
+    poap_log("INFO: SIGTERM Handler while configuring boot variables")
+
+def sigterm_handler (signum, frame): 
+    poap_log("INFO: SIGTERM Handler") 
+    abort_cleanup_exit()
+    exit(1)
+
+#shouldn't we put it in the main code
+signal.signal(signal.SIGTERM, sigterm_handler)
+
+
+# Procedure to split config file using global information
+def splitConfigFile (config_conf,cable_conf):
+    cable_injection = False
+    configFile = open("/bootflash/%s" % config_conf.config_file_dst, "r")
+    configFile_first  = open("/bootflash/%s" % config_conf.config_file_dst_first, "w+")
+    configFile_second = open("/bootflash/%s" % config_conf.config_file_dst_second, "w+")
+    line = configFile.readline()
+    while line != "":
+        if not string.find(line, "system vlan", 0, 11) or not string.find(line, "interface breakout", 0, 18) or not string.find(line, "hardware profile tcam", 0, 21) or not string.find(line, "type fc", 0, 7) or not string.find(line, "fabric-mode 40G", 0, 15) or not string.find(line, "fabricpath mode transit", 0, 23) or not string.find(line, "fabric-mode 10G", 0, 15):
+            poap_log("INFO: Generating config for splitConfig..")
+            if not string.find(line, "fabricpath mode transit", 0, 23):
+               configFile_first.write("install feature-set fabricpath\n")
+               configFile_first.write("feature-set fabricpath\n")
+            configFile_first.write(line)
+            if config_conf.empty_first_file == 1:
+                config_conf.empty_first_file = 0
+        else:
+            # remove any boot commands from the config file
+	    if not string.find(line,"boot kickstart",0,14) or not string.find(line,"boot system",0,11):
+               pass
+            else:
+               configFile_second.write(line)
+
+        if cable_conf and cable_conf.dependency_cmd in line:
+           cable_injection = True
+           
+        line = configFile.readline()
+
+    #cable -- inject cable import command
+    if not g_skip_cable_management and cable_injection:
+       poap_log("INFO: Inject cable import stmt into startup config")
+       configFile_second.write(cable_conf.inject_stmt)
+
+    configFile.close()
+    configFile_first.close()
+    configFile_second.close()
+    return
+
+# transfers file, return True on success; on error exits unless 'fatal' is False in which case we return False
+def doCopy(protocol = "", host = "", source = "", dest = "", vrf = "management", login_timeout=10, user = "", password = "", staging=False, fatal=True):
+    # without remove the file first, copy scp fails if img is used for boot
+    dest_file = dest
+    if(staging):
+	dest_file = "%s.tmp" %dest
+    os_rm_rf(g_unix_destination_path + dest_file) 
+
+    poap_log("INFO: Ready to copy protocol %s, host %s, source %s vrf %s user %s password %s" %(protocol,host,source,vrf,user,"*****"))
+
+    if (g_use_builtin_transfer_func == False) :
+        cmd="copy %s://%s@%s%s %s vrf %s" % (protocol, user, host, source, dest_file, vrf)
+        #print cmd
+        try: 
+    		cli("terminal password %s" % password);
+		run_cli(cmd)
+        except:
+            poap_log("WARN: Copy %s Failed: %s" % (source, str(sys.exc_value).strip('\n\r')))
+            if fatal:
+                poap_log("ERROR: Copy %s Failed: %s" % (source, str(sys.exc_value).strip('\n\r')))
+                abort_cleanup_exit()
+                exit(1)
+            return False
+    else:
+        try:
+            transfer(protocol, host, source, dest_file, vrf, login_timeout, user, password)
+        except Exception as inst:
+            poap_log("WARN: Copy %s Failed: %s" %(source, inst))
+            if fatal:
+                poap_log("ERROR: Copy %s Failed: %s" %(source, inst))
+                abort_cleanup_exit()
+                exit(1)
+            return False
+
+    if(staging):
+          os_rename(g_unix_destination_path+dest_file, g_unix_destination_path+dest)
+    return True
+
+
+def get_md5sum_src (conf,file_name):
+    md5_file_name_src = "%s.%s" % (file_name, MD5SUM_EXT_SRC)
+    md5_file_name_dst = "volatile:%s.poap_md5" % os.path.basename(md5_file_name_src)
+    rm_rf(md5_file_name_dst)
+
+    ret=doCopy(conf.protocol, conf.hostname, md5_file_name_src, md5_file_name_dst, conf.vrf, conf.md5sum_timeout, conf.username, conf.password, False)
+    if ret == True:
+        r=run_cli("show file %s" % md5_file_name_dst)
+        match = re.search("^([0-9a-f]+)\s+.*", r, re.MULTILINE)
+        if match:
+            sum = match.group(1)
+        else:
+            poap_log("WARN: Unable to get the md5 sum")
+            return None
+        poap_log("INFO: md5sum %s (.md5 file)" % sum)
+        rm_rf(md5_file_name_dst)
+        return sum
+    return None
+    # if no .md5 file, and text file, could try to look for an embedded checksum (see below)
+
+
+def check_embedded_md5sum (filename):
+    # extract the embedded checksum
+    sum_emb=run_cli("show file %s | grep '^#md5sum' | head lines 1 | sed 's/.*=//'" % filename).strip('\n')
+    if sum_emb == "":
+        poap_log("INFO: no embedded checksum")
+        return None
+    poap_log("INFO: md5sum %s (embedded)" % sum_emb)
+
+    # remove the embedded checksum (create temp file) before we recalculate
+    cmd="show file %s exact | sed '/^#md5sum=/d' > volatile:poap_md5" % filename
+    run_cli(cmd)
+    # calculate checksum (using temp file without md5sum line)
+    sum_dst=run_cli("show file volatile:poap_md5 md5sum").strip('\n')
+    poap_log("INFO: md5sum %s (recalculated)" % sum_dst)
+    try: run_cli("delete volatile:poap_md5")
+    except: pass
+    if sum_emb != sum_dst:
+        poap_log("ERROR: MD5 verification failed for %s" % filename)
+        abort_cleanup_exit()
+
+    return None
+
+def get_md5sum_dst (filename):
+    sum=run_cli("show file %s md5sum" % filename).strip('\n')
+    poap_log("INFO: md5sum %s (recalculated)" % sum)
+    return sum  
+
+def check_md5sum (conf,filename_src, filename_dst, lname):
+    if(g_check_md5_sum == False): return
+    md5sum_src = get_md5sum_src(conf,filename_src)
+    if md5sum_src: # we found a .md5 file on the server
+        md5sum_dst = get_md5sum_dst(filename_dst)
+        if md5sum_dst != md5sum_src:
+             poap_log("ERROR: MD5 verification failed for %s! (%s)" % (lname, filename_dst))
+             abort_cleanup_exit()
+
+# Will run our CLI command to test MD5 checksum and if files are valid images
+# This check is also performed while setting the boot variables, but this is an
+# additional check
+
+def get_md5_status (msg):
+   
+    lines=msg.split("\n") 
+    for line in lines:
+        index=line.find("MD5")
+        if (index!=-1):
+            status=line[index+17:]
+            return status
+
+def get_version (msg):
+   
+    lines=msg.split("\n") 
+    for line in lines:
+        index=line.find("MD5")
+        if (index!=-1):
+            status=line[index+17:]
+
+        index=line.find("kickstart:")
+        if (index!=-1): 
+            index=line.find("version")
+            ver=line[index:]
+            return ver
+
+        index=line.find("system:")
+        if (index!=-1):
+            index=line.find("version")
+            ver=line[index:]
+            return ver
+    
+def get_image_version(image):
+    version = UNABLE_TO_RETRIEVE
+    out = None
+    try:
+        out = cli("show version image %s" % image)
+        if type(out) != str:
+	  out = out[1]
+        # This is a Hack; once the "plugin based. failed to get image swid"
+        # is fixed this  expect part can be removed.
+    except:
+        out = sys.exc_value
+	if type(out) != str:
+          out = out[0]
+
+    if out is not None:
+      match = re.search("image name:\s+([a-zA-Z\.\-0-9]+)\n", out, re.MULTILINE)
+      if match:
+        split_image = match.group(1).split('.')
+        version = ".".join(split_image[1:len(split_image) -1])
+
+    return version
+
+def verify_images (conf):
+
+    if g_box=="n5k" or g_box == "n6k":
+        # This is to fix the n5k/n6k system image bug
+        kick_v=get_image_version(conf.kickstart_image_dst)
+        if kick_v == UNABLE_TO_RETRIEVE:
+          poap_log("WARN : Cannot verify kickstart image: %s" %conf.kickstart_image_dst)
+          return True
+
+        sys_v=get_image_version(conf.system_image_dst)
+        if sys_v == UNABLE_TO_RETRIEVE:
+          poap_log("WARN : Cannot verify system image: %s" %conf.system_image_dst)
+          return True
+
+        if kick_v != sys_v: 
+            poap_log("ERROR: Image version mismatch. (kickstart : %s) (system : %s)" % (kick_v, sys_v))
+            abort_cleanup_exit()
+        return True
+
+    kick_cmd="show version image %s" % conf.kickstart_image_dst
+    sys_cmd="show version image %s" % conf.system_image_dst
+
+    kick_msg=run_cli(kick_cmd)
+    sys_msg=run_cli(sys_cmd)
+
+    if(kick_msg is None):
+        poap_log("WARN : Cannot verify kickstart image: %s" %conf.kickstart_image_dst)
+	return
+    if(sys_msg is None):
+        poap_log("WARN : Cannot verify system image: %s" %conf.system_image_dst)
+	return
+
+    # n3k, n6k images do not provide md5 information
+    if g_box=="n7k" or g_box == "titanium":
+        kick_s=get_md5_status(kick_msg)
+        sys_s=get_md5_status(sys_msg)    
+
+    kick_v=get_version(kick_msg)
+    sys_v=get_version(sys_msg)
+    
+    if g_box=="n7k" or g_box == "titanium": 
+        print "MD5 status: %s and %s" % (kick_s, sys_s)
+        if (kick_s == "Passed" and sys_s == "Passed"):
+            # MD5 verification passed
+            if(kick_v != sys_v): 
+                poap_log("ERROR: Image version mismatch. (kickstart : %s) (system : %s)" % (kick_v, sys_v))
+                abort_cleanup_exit()
+        else:
+            poap_log("ERROR: MD5 verification failed!")
+            poap_log("%s\n%s" % (kick_msg, sys_msg))
+            abort_cleanup_exit()
+        poap_log("INFO: Verification passed. (kickstart : %s) (system : %s)" % (kick_v, sys_v))
+        return True
+    else:
+        if kick_v != sys_v: 
+            poap_log("ERROR: Image version mismatch. (kickstart : %s) (system : %s)" % (kick_v, sys_v))
+            abort_cleanup_exit()
+    
+        return True
+
+def cleanup_files (config_conf):
+    try:
+        poap_log("FINISH: Clean up files.")
+        run_cli("delete %s" % config_conf.config_file_dst)
+        if config_conf.empty_first_file == 1:
+            run_cli("delete %s" % config_conf.config_file_dst_first)
+        run_cli("delete %s" % config_conf.config_file_dst_second)
+    except:
+        poap_log("Error in clean up files")
+        pass
+        
+# get config file from server
+def get_config (conf, cable):
+
+    doCopy (conf.protocol, conf.hostname, conf.config_file_src, 
+	    conf.config_file_dst, conf.vrf, conf.config_timeout, 
+            conf.username, conf.password)
+    poap_log("INFO: Completed Copy of Config File") 
+        
+    # get file's md5 from server (if any) and verify it, failure is fatal (exit)
+    check_md5sum (conf,conf.config_file_src, conf.config_file_dst, "config file")
+    poap_log("INFO: Split config invoked....")
+    splitConfigFile(conf,cable)
+    poap_log("INFO: Split config is complete")
+
+# get system image file from server
+def get_system_image (conf):
+
+    doCopy (conf.protocol, conf.hostname, conf.system_image_src, 
+	    conf.system_image_dst, conf.vrf, conf.system_timeout, 
+            conf.username, conf.password,True)  
+    poap_log("INFO: Completed Copy of System Image" ) 
+    
+    # get file's md5 from server (if any) and verify it, failure is fatal (exit)
+    check_md5sum (conf,conf.system_image_src, conf.system_image_dst, "system image")
+    #run_cli ("move %s %s" % (system_image_dst_tmp, system_image_dst))
+
+
+# get kickstart image file from server
+def get_kickstart_image (conf):
+
+    doCopy (conf.protocol, conf.hostname, conf.kickstart_image_src, 
+	    conf.kickstart_image_dst, conf.vrf, 
+	    conf.kickstart_timeout, conf.username, conf.password,True)  
+    poap_log("INFO: Completed Copy of Kickstart Image") 
+    
+    # get file's md5 from server (if any) and verify it, failure is fatal (exit)
+    check_md5sum (conf,conf.kickstart_image_src, conf.kickstart_image_dst, "kickstart image")
+    #run_cli ("move %s %s" % (kickstart_image_dst_tmp, kickstart_image_dst))
+
+
+def wait_box_online ():
+    num_of_retries = 20
+    interval = 30
+    see_box_online = False
+    while num_of_retries > 0:
+        try:
+          r=run_cli("show system internal ascii-cfg event-history | grep BOX_ONLINE")
+	  poap_log("show system internal .. return %s" %r)
+	  if r:
+		poap_log("INFO: SEE BOX_ONLINE from event-history")
+    		see_box_online = True
+		break
+ 	  else:
+            r=run_cli("show system internal ascii-cfg event-history")
+	    poap_log("INFO: show system internal ... %s" %r)
+        except:
+	  pass
+
+    	if g_box=="n7k" or g_box == "titanium": 
+          try:
+	    r=int(run_cli("show system internal platform internal info | grep box_online | sed 's/[^0-9]*//g'").strip('\n'))
+
+            if r==1: 
+		poap_log("INFO: SEE BOX_ONLINE from platform internal info")
+    		see_box_online = True
+		break
+          except:
+            pass
+
+        time.sleep(interval)
+	num_of_retries = num_of_retries - 1
+        poap_log("INFO: Waiting for box online...") 
+
+    if see_box_online == False:
+      poap_log("WARN: Unable to see box online ontime with retries of 20 times with %d sec interval" %(interval))
+      #abort_cleanup_exit()
+
+# install (make persistent) images and config 
+def install_it (image_conf,config_conf): 
+    global cl_download_only, g_boot_stage
+    if cl_download_only: exit(0)
+    timeout = -1
+
+    # make sure box is online
+    if g_box=="n7k": wait_box_online()
+    if g_box=="n6k": 
+	if not g_os_version.startswith("6.0(2)N1") and not g_os_version.startswith("6.0(2)N2"):
+	  g_boot_stage = BOOT_STATE_WAIT_BOX_ONLINE
+          send_boot_status("waiting the box online before install the boot variables")
+	  wait_box_online()
+
+    poap_log("INFO: Setting the boot variables")
+    g_boot_stage = BOOT_STATE_INSTALLING_BOOT_COMMAND
+    send_boot_status()
+    try:
+        r=run_cli ("config terminal ; boot kickstart %s" % image_conf.kickstart_image_dst)
+	if(r is not None):
+	  poap_log("INFO: result of boot kickstart %s" %r)
+        r=run_cli ("config terminal ; boot system %s" % image_conf.system_image_dst)
+	if(r is not None):
+	  poap_log("INFO: result of boot system %s" %r)
+        r=run_cli ("copy running-config startup-config")
+
+        g_boot_stage = BOOT_STATE_INSTALLED_BOOT_COMMAND
+        send_boot_status()
+
+	if config_conf.empty_first_file is 0:
+           g_boot_stage = BOOT_STATE_SPLIT_SCHEDULE_CONFIG_1
+	   send_boot_status()
+           r=run_cli ('copy %s scheduled-config' % config_conf.config_file_dst_first)
+           poap_log("INFO:  Copying the first scheduled cfg done")
+           run_cli("delete %s" % config_conf.config_file_dst_first)
+	
+	if config_conf.empty_first_file is 0:
+          g_boot_stage = BOOT_STATE_SPLIT_SCHEDULE_CONFIG_2
+	  send_boot_status()
+	else:
+          g_boot_stage = BOOT_STATE_SCHEDULE_CONFIG
+	  send_boot_status()
+        r=run_cli ('copy %s scheduled-config' % config_conf.config_file_dst_second)
+	if config_conf.empty_first_file is 0:
+          poap_log("INFO: Copying the second scheduled cfg done")
+        else:
+          poap_log("INFO: Copying the scheduled cfg done")
+    except:
+        poap_log("ERROR: setting bootvars or copy run start failed!")
+        poap_log("EXCEPTION: msg: %s" % str(sys.exc_value).strip('\n\r'))
+        traceback.print_exc(file=sys.stdout)
+        sys.stdout.flush()
+        abort_cleanup_exit()
+    poap_log("INFO: Configuration successful")
+
+        
+# Verify if free space is available to download config, kickstart and system images
+def verify_freespace (): 
+    poap_log("INFO: check free space")
+    out=run_cli("dir bootflash:")
+    match = re.search("^\s+([0-9]+)\s+bytes\s+free$", out, re.MULTILINE)
+    if match:
+        freespace=int(match.group(1))/1024
+    else:
+        poap_log("ERROR: Unable to get free space")
+        poap_log_file.close()
+        abort_cleanup_exit()
+
+    poap_log("INFO: free space is %s kB"  % freespace )
+
+    if g_required_space > freespace:
+        poap_log("ERROR: Not enough space to copy the config, kickstart image and system image, aborting!")
+        abort_cleanup_exit()
+
+def setChassisSerialNumber():
+  serial_number = ""
+  r=run_cli("show license host-id")
+  p = re.compile(".*hostid.*=(.*:)?(.*)")
+  if(r is not None):
+    m = p.match(r)
+    if(m is not None):
+      serial_number = m.group(2)
+      poap_log("INFO: Get serial number: %s" %serial_number)
+  else:
+        print "No output for show license host-id"
+  return serial_number.strip()
+  
+g_serial_number = setChassisSerialNumber()
+print "Device Serial Number: %s" %g_serial_number
+g_poap_syslog_prefix = "S/N[%s]" % g_serial_number
+######## DCNM specific code ##############
+
+
+############### SimpleJSON ##############
+class JSONError(Exception):
+    def __init__(self, msg, stm=None, pos=0):
+        if stm:
+            msg += ' at position %d, "%s"' % (pos, repr(stm.substr(pos, 32)))
+        Exception.__init__(self, msg)
+
+
+class JSONStream(object):
+    # character classes
+    WS = set([' ','\t','\r','\n','\b','\f'])
+
+    # error messages
+    E_BYTES = 'input string must be type str containing ASCII or UTF-8 bytes'
+    E_MALF = 'malformed JSON data'
+    E_TRUNC = 'truncated JSON data'
+    E_LITEM = 'expected list item'
+    E_DKEY = 'expected key'
+    E_COLON = 'missing colon after key'
+
+    # no longer inherit directly from StringIO, since we only want to
+    # expose the methods below and not allow direct access to the 
+    # underlying stream.
+
+    def __init__(self, data):
+        self._stm = StringIO.StringIO(data)
+
+    @property
+    def pos(self):
+        return self._stm.pos
+
+    @property
+    def len(self):
+        return self._stm.len
+
+    def getvalue(self):
+        return self._stm.getvalue()
+
+    def skipspaces(self):
+        "post-cond: read pointer will be over first non-WS char"
+        self._skip(lambda c: c not in self.WS)
+
+    def _skip(self, stopcond):
+        while True:
+            c = self.peek()
+            if stopcond(c) or c == '':
+                break
+            self.next()
+
+    def next(self, size=1):
+        return self._stm.read(size)
+
+    def peek(self):
+        if self.pos == self.len:
+            return ''
+        return self.getvalue()[self.pos]
+
+    def substr(self, pos, length):
+        return self.getvalue()[pos:pos+length]
+
+    def from_json_string(self):
+      # skip over '"'
+      self.next()  
+      r = []
+      while True:
+        c = self.next()
+        if c == '':
+            raise JSONError(self.E_TRUNC, self, self.pos - 1)
+        elif c == '"':
+            return ''.join(r)
+        else:
+            r.append(c)
+
+    def from_json_int(self):
+      r = []
+      while True:
+        c = self.peek()
+        if c == '':
+            raise JSONError(self.E_TRUNC, self, self.pos - 1)
+	elif c in ['1','2','3','4','5','6','7','8','9','0']:
+	    c= self.next()
+	    r.append(c)
+        else:
+	    return ''.join(r)
+
+
+    def from_json_list(self):
+      # skip over '['
+      self.next()
+      result = []
+      pos = self.pos
+      while True:
+        self.skipspaces()
+        c = self.peek()
+        if c == '':
+            raise JSONError(self.E_TRUNC, self, pos)
+
+        elif c == ']':
+            self.next()
+            return result
+
+        elif c == ',':
+            self.next()
+            result.append(self.from_json_raw())
+            continue
+
+        elif not result:
+            # first item
+            result.append(self.from_json_raw())
+            continue
+
+        else:
+            raise JSONError(self.E_MALF, self, self.pos)
+
+
+    def from_json_dict(self):
+      # skip over '{'
+      self.next()
+      result = {}
+      expect_key = 0
+      pos = self.pos
+      while True:
+        self.skipspaces()
+        c = self.peek()
+        if c == '':
+            raise JSONError(self.E_TRUNC, self, pos)
+
+        # end of dictionary, or next item
+        if c in ('}',','):
+            self.next()
+            if expect_key:
+                raise JSONError(self.E_DKEY, self, self.pos)
+            if c == '}':
+                return result
+            expect_key = 1
+            continue
+
+        # parse out a key/value pair
+        elif c == '"':
+            key = self.from_json_string()
+            self.skipspaces()
+            c = self.next()
+            if c != ':':
+                raise JSONError(self.E_COLON, self, self.pos)
+
+            self.skipspaces()
+            val = self.from_json_raw()
+            result[key] = val
+            expect_key = 0
+            continue
+
+        # unexpected character in middle of dict
+        raise JSONError(self.E_MALF, self, self.pos)
+
+
+    def from_json_raw(self):
+      while True:
+        self.skipspaces()
+        c = self.peek()
+        if c == '"': 
+            return self.from_json_string()
+        elif c == '{': 
+            return self.from_json_dict()
+        elif c == '[': 
+            return self.from_json_list()
+	elif c in ['1','2','3','4','5','6','7','8','9','0']:
+	    return self.from_json_int()
+
+        raise JSONError(self.E_MALF, self, self.pos)
+
+
+    @staticmethod
+    def from_json(data):
+      """
+      Converts 'data' which is UTF-8 (or the 7-bit pure ASCII subset) into
+      a Python representation.  You must pass bytes to this in a str type,
+      not unicode.
+      """
+      if not isinstance(data, str):
+        raise JSONError(self.E_BYTES)
+      if not data:
+        return None
+      stm = JSONStream(data)
+      return stm.from_json_raw()
+
+############### SimpleJSON ##############
+
+def parse_json(filename):
+  try:
+    fh = open(g_unix_destination_path+filename);
+    data = fh.read()
+    fh.close()
+    res = JSONStream.from_json(data)
+    if g_debug:
+      poap_log("INFO: parsed json data: %s" %res)
+    return res
+  except:
+    poap_log("EXCEPTION: %s" %traceback.format_exc())
+    poap_log("ERROR: parsing json file %s" %filename)
+    abort_cleanup_exit()
+    exit(1)
+
+def get_image_config_server_info(conf):
+  doCopy (conf.protocol, conf.hostname, conf.image_config_server_src, conf.image_config_server_dst, conf.vrf, conf.download_timeout, conf.username, conf.password)
+  poap_log("INFO: Get Device Image Config File") 
+  return parse_json(conf.image_config_server_dst)
+
+def get_device_recipe(conf):
+  doCopy (conf.protocol, conf.hostname, conf.device_recipe_src, conf.device_recipe_dst, conf.vrf, conf.download_timeout, conf.username, conf.password)
+  poap_log("INFO: Get Device Recipe") 
+  return parse_json(conf.device_recipe_dst)
+
+#cable
+def get_cable_file(conf):
+    doCopy (conf.protocol, conf.hostname, conf.cable_file_src, 
+	    conf.cable_file_dst, conf.vrf, 
+	    conf.cable_timeout, conf.username, conf.password,True)  
+    poap_log("INFO: Completed Copy of Cable file") 
+
+def get_device_script(conf,script_name):
+  doCopy (conf.protocol, conf.hostname, script_name, script_name, conf.vrf, conf.download_timeout, conf.username, conf.password)
+  poap_log("INFO: Get Device Script") 
+
+def exec_device_script(script_name):
+  try:
+    pass
+  except:
+    poap_log("WARN: %s" %traceback.format_exc())
+  
+
+def getProtocolIPPortPath(url):
+  port = ""
+  pos = url.find("://")
+  protocol = url[0:pos]
+  ip = url[pos+3:]
+  pos = ip.find("/")
+  path = ip[pos:]
+  ip = ip[:pos]
+  pos = ip.find(":")
+  if(pos != -1):
+    port = ip[pos+1:]
+    ip = ip[:pos]
+  print protocol + "," + ip + "," + port + "," + path
+  return (protocol, ip, port, path)
+
+
+def create_image_conf(servers,deviceRecipe):
+  poap_log("INFO: create_image_conf")
+  conf = ImageConf()
+  ksImage = deviceRecipe["kick-start-image"]["image-name"]
+  sysImage = deviceRecipe["system-image"]["image-name"]
+  imageServerName = deviceRecipe["kick-start-image"]["download-server"];
+  imageServer = servers["repositories"][imageServerName]
+  url = imageServer["url"]
+  protocol,ip,port,path = getProtocolIPPortPath(url)
+  conf.vrf = g_vrf
+  conf.protocol = protocol
+  conf.hostname = ip
+  conf.kickstart_image_src = path + "/" + ksImage
+  conf.kickstart_image_dst = ksImage
+  conf.system_image_src = path + "/" + sysImage
+  conf.system_image_dst = sysImage
+  conf.username = imageServer["username"]
+  conf.password = imageServer["password"]
+  return conf
+
+def create_config_conf(servers,deviceRecipe):
+  conf = ConfigConf()
+  startupConfig = deviceRecipe["startup-config"]["config-name"]
+  configServerName = deviceRecipe["startup-config"]["download-server"];
+  configServer = servers["repositories"][configServerName]
+  url = configServer["url"]
+  protocol,ip,port,path = getProtocolIPPortPath(url)
+  conf.vrf = g_vrf
+  conf.protocol = protocol
+  conf.hostname = ip
+  conf.config_file_src = path + "/" + g_serial_number + "/" + startupConfig
+  conf.config_file_dst = startupConfig
+  conf.username = configServer["username"]
+  conf.password = configServer["password"]
+  return conf
+
+#cable
+def create_cable_conf(servers,deviceRecipe):
+  if "resources" not in servers:
+    return None
+  if "cable" not in servers["resources"]:
+    return None
+
+  cable = servers["resources"]["cable"]
+  cableFileName = cable["cable-filename"]
+  cableServerName = cable["download-server"];
+  cableDependencyCmd = cable["dependency"];
+  cableServer = servers["repositories"][cableServerName]
+  url = cableServer["url"]
+  protocol,ip,port,path = getProtocolIPPortPath(url)
+  conf = CableConf()
+  conf.vrf = g_vrf
+  conf.protocol = protocol
+  conf.hostname = ip
+  conf.cable_file_src = path + "/" + cableFileName
+  conf.cable_file_dst = cableFileName
+  conf.username = cableServer["username"]
+  conf.password = cableServer["password"]
+  conf.dependency_cmd = cableDependencyCmd
+  conf.inject_stmt = "fabric connectivity cable-plan import bootflash:%s\n" %conf.cable_file_dst
+  return conf
+
+#
+# DCNM server info, populated when generating this file
+#
+class DCNMConf:
+  hostname=g_dcnm_hostname
+  username=decode(g_dcnm_username)
+  password=decode(g_dcnm_password)
+
+#
+# DCNM File Repository server info.
+# This file server holds image&config server information
+#
+class DCNMRepositoryConf:
+  hostname=g_dcnm_repo_hostname
+  username=decode(g_dcnm_repo_username)
+  password=decode(g_dcnm_repo_password)
+  protocol="scp"
+  vrf=g_vrf
+  resource_dir_path=g_file_repository_path
+  image_config_server_src=resource_dir_path + "/dcnm-server-list.cfg"
+  image_config_server_dst="dcnm-server-list.cfg"
+  device_recipe_src=resource_dir_path + "/" + g_serial_number + "/device-recipe.cfg"
+  device_recipe_dst="device-recipe.cfg"
+  download_timeout = 120
+
+class ImageConf:
+  protocol=""
+  hostname=""
+  kickstart_image_src=""
+  kickstart_image_dst=""
+  system_image_src=""
+  system_image_dst=""
+  vrf="management"
+  kickstart_timeout=900
+  system_timeout=2100
+  md5sum_timeout=120
+  username=""
+  password=""
+
+class ConfigConf:
+  protocol=""
+  hostname=""
+  config_file_src=""
+  config_file_dst=""
+  config_file_dst_first="poap_1.cfg"
+  config_file_dst_second="poap_2.cfg"
+  empty_first_file=1
+  vrf="management"
+  config_timeout=120
+  md5sum_timeout=120
+  username=""
+  password=""
+
+class CableConf:
+  protocol=""
+  hostname=""
+  cable_file_src=""
+  cable_file_dst=""
+  vrf="management"
+  cable_timeout=120
+  md5sum_timeout=120
+  username=""
+  password=""
+  dependency_cmd = None
+  inject_stmt = None
+
+# poap starting here
+poap_log("INFO:device type is %s" %g_box)
+poap_log("INFO:device os version is %s" %g_os_version)
+g_token = None
+g_token = logon(DCNMConf.hostname, DCNMConf.username, DCNMConf.password)
+g_boot_stage = BOOT_STATE_STARTED
+send_boot_status("")
+  
+# finaly do it
+poap_cleanup_script_logs()
+verify_freespace()
+g_boot_stage = BOOT_STATE_STARTED
+send_boot_status("Check Free Space")
+
+# dcnm specific
+# get image & config server list
+# get device recipe
+# from device recipe + image&config server list,
+# find out the kickstart/system image, and the corresponding access info
+dcnm_repository_conf = DCNMRepositoryConf()
+g_boot_stage = BOOT_STATE_DOWNLOADING_IMAGE_CONFIG_SERVER_LIST
+send_boot_status("downloading image&config server %s" %dcnm_repository_conf.image_config_server_src)
+resourceServerRegistry = get_image_config_server_info(dcnm_repository_conf)
+g_boot_stage = BOOT_STATE_DOWNLOADED_IMAGE_CONFIG_SERVER_LIST
+send_boot_status("image&config server %s is downloaded" %dcnm_repository_conf.image_config_server_src)
+os_rm_rf(g_unix_destination_path + dcnm_repository_conf.image_config_server_dst)
+
+g_boot_stage = BOOT_STATE_DOWNLOADING_DEVICE_RECIPE
+send_boot_status("downloading device recipe %s" %dcnm_repository_conf.device_recipe_src)
+deviceRecipe = get_device_recipe(dcnm_repository_conf)
+g_boot_stage = BOOT_STATE_DOWNLOADED_DEVICE_RECIPE
+send_boot_status("device recipe %s is downloaded" %dcnm_repository_conf.device_recipe_src)
+os_rm_rf(g_unix_destination_path + dcnm_repository_conf.device_recipe_dst)
+
+image_conf=create_image_conf(resourceServerRegistry,deviceRecipe)
+config_conf=create_config_conf(resourceServerRegistry,deviceRecipe)
+
+g_boot_stage = BOOT_STATE_DOWNLOADING_IMAGE
+send_boot_status("downloading image %s" %image_conf.kickstart_image_src)
+get_kickstart_image(image_conf)
+g_boot_stage = BOOT_STATE_DOWNLOADED_IMAGE
+send_boot_status("image %s is downloaded" %image_conf.kickstart_image_src)
+
+g_boot_stage = BOOT_STATE_DOWNLOADING_IMAGE
+send_boot_status("downloading image %s" %image_conf.system_image_src)
+get_system_image(image_conf)
+g_boot_stage = BOOT_STATE_DOWNLOADED_IMAGE
+send_boot_status("image %s is downloaded" %image_conf.system_image_src)
+
+g_boot_stage = BOOT_STATE_VERIFYING_IMAGE
+verify_images(image_conf)
+g_boot_stage = BOOT_STATE_VERIFIED_IMAGE
+
+g_boot_stage = BOOT_STATE_DOWNLOADING_CABLE
+cable_conf=create_cable_conf(resourceServerRegistry,deviceRecipe)
+if cable_conf is not None:
+  send_boot_status("downloading cable plan %s" %cable_conf.cable_file_src)
+  get_cable_file(cable_conf)
+  g_boot_stage = BOOT_STATE_DOWNLOADED_CABLE
+  send_boot_status("cable plan %s is downloaded" %cable_conf.cable_file_src)
+
+g_boot_stage = BOOT_STATE_DOWNLOADING_CONFIG
+send_boot_status("downloading %s" %config_conf.config_file_src)
+get_config(config_conf,cable_conf)
+g_boot_stage = BOOT_STATE_DOWNLOADED_CONFIG
+send_boot_status("%s is downloaded" %config_conf.config_file_src)
+
+# prevent someone from sending a signal while we install the config
+signal.signal(signal.SIGTERM, sig_handler_no_exit)
+install_it(image_conf,config_conf)
+cleanup_files(config_conf)
+
+g_boot_stage = BOOT_STATE_COMPLETE
+send_boot_status()
+poap_log_close()
+exit(0)
+
+]0;root@dfa-dcnm:~[root@dfa-dcnm ~]#  
